@@ -6,54 +6,31 @@ import base64
 import json
 import jwt
 import datetime
-import sqlite3
-import time
 
 hostName = "localhost"
 serverPort = 8080
 
-DB_FILE = "totally_not_my_privateKeys.db"
-
-# Initiate database and create table 
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS keys(
-    kid INTEGER PRIMARY KEY AUTOINCREMENT,
-    key BLOB NOT NULL,
-    exp INTEGER NOT NULL
+private_key = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
 )
-""")
-conn.commit()
+expired_key = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+)
 
-def serialize_key(key):
-    """Convert an RSA key to PEM string for DB storage"""
-    return key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption()
-    )
+pem = private_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.TraditionalOpenSSL,
+    encryption_algorithm=serialization.NoEncryption()
+)
+expired_pem = expired_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.TraditionalOpenSSL,
+    encryption_algorithm=serialization.NoEncryption()
+)
 
-def deserialize_key(pem_data):
-    """Convert PEM string from DB back to RSA private key"""
-    return serialization.load_pem_private_key(pem_data, password=None)
-
-def ensure_keys_exist():
-    cursor.execute("SELECT COUNT(*) FROM keys")
-    count = cursor.fetchone()[0]
-
-    if count == 0:
-        print("🔑 Generating initial keys...")
-        valid_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        expired_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        now = int(time.time())
-
-        cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (serialize_key(expired_key), now - 10))
-        cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (serialize_key(valid_key), now + 3600))
-        conn.commit()
-        print("✅ Keys generated and stored.")
-
-ensure_keys_exist()
+numbers = private_key.private_numbers()
 
 
 def int_to_base64(value):
@@ -91,33 +68,18 @@ class MyServer(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed_path = urlparse(self.path)
         params = parse_qs(parsed_path.query)
-
         if parsed_path.path == "/auth":
-            expired = 'expired' in params
-            now = int(time.time())
-
-            if expired:
-                cursor.execute("SELECT kid, key, exp FROM keys WHERE exp <= ? LIMIT 1", (now,))
-            else:
-                cursor.execute("SELECT kid, key, exp FROM keys WHERE exp > ? LIMIT 1", (now,))
-
-            row = cursor.fetchone()
-            if not row:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b"No suitable key found.")
-                return
-
-            kid, pem_data, exp = row
-            key = deserialize_key(pem_data)
-
-            headers = {"kid": str(kid)}
-            token_payload = {
-                "user": "userABC",
-                "exp": exp
+            headers = {
+                "kid": "goodKID"
             }
-
-            encoded_jwt = jwt.encode(token_payload, key, algorithm="RS256", headers=headers)
+            token_payload = {
+                "user": "username",
+                "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            }
+            if 'expired' in params:
+                headers["kid"] = "expiredKID"
+                token_payload["exp"] = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
+            encoded_jwt = jwt.encode(token_payload, pem, algorithm="RS256", headers=headers)
             self.send_response(200)
             self.end_headers()
             self.wfile.write(bytes(encoded_jwt, "utf-8"))
@@ -125,37 +87,32 @@ class MyServer(BaseHTTPRequestHandler):
 
         self.send_response(405)
         self.end_headers()
-
+        return
 
     def do_GET(self):
         if self.path == "/.well-known/jwks.json":
-            now = int(time.time())
-            cursor.execute("SELECT kid, key, exp FROM keys WHERE exp > ?", (now,))
-            rows = cursor.fetchall()
-
-            jwks = {"keys": []}
-            for kid, pem_data, exp in rows:
-                key = deserialize_key(pem_data)
-                numbers = key.private_numbers().public_numbers
-
-                jwks["keys"].append({
-                    "alg": "RS256",
-                    "kty": "RSA",
-                    "use": "sig",
-                    "kid": str(kid),
-                    "n": int_to_base64(numbers.n),
-                    "e": int_to_base64(numbers.e)
-                })
-
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(bytes(json.dumps(jwks), "utf-8"))
+            keys = {
+                "keys": [
+                    {
+                        "alg": "RS256",
+                        "kty": "RSA",
+                        "use": "sig",
+                        "kid": "goodKID",
+                        "n": int_to_base64(numbers.public_numbers.n),
+                        "e": int_to_base64(numbers.public_numbers.e),
+                    }
+                ]
+            }
+            self.wfile.write(bytes(json.dumps(keys), "utf-8"))
             return
 
         self.send_response(405)
         self.end_headers()
-conn.close()
+        return
+
 
 if __name__ == "__main__":
     webServer = HTTPServer((hostName, serverPort), MyServer)
