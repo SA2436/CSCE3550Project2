@@ -4,7 +4,7 @@ import sqlite3
 import json
 import pytest
 
-from main import app, DB_FILENAME, ensure_db_and_table, get_db_conn, serialize_private_key_to_pem
+from py3.main import app, DB_FILENAME, ensure_db_and_table, get_db_conn, serialize_private_key_to_pem
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 TEST_DB = DB_FILENAME
@@ -19,7 +19,7 @@ def fresh_db(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_DB_PATH", str(db_file))
     # Monkeypatch the DB filename constant in the imported module
     import importlib
-    import main as m
+    import py3.main as m
     m.DB_FILENAME = str(db_file)
     # Create DB and table
     ensure_db_and_table()
@@ -42,7 +42,7 @@ def test_index():
 def test_jwks_and_auth_endpoints():
     client = app.test_client()
     # Ensure DB has the two keys inserted by ensure_minimum_keys (called on import/run)
-    from main import ensure_minimum_keys, list_keys, choose_key
+    from py3.main import ensure_minimum_keys, list_keys, choose_key
     ensure_minimum_keys()
     rows = list_keys(filter_unexpired=False)
     assert len(rows) >= 2  # we expect at least two keys in DB
@@ -72,7 +72,7 @@ def test_jwks_and_auth_endpoints():
 
 def test_db_storage_roundtrip():
     # Directly insert a generated key, then retrieve it
-    from main import store_private_key, choose_key
+    from py3.main import store_private_key, choose_key
     priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     pem = serialize_private_key_to_pem(priv)
     now = int(time.time())

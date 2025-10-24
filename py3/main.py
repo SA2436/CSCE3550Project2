@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""
-main.py
-
-JWKS server with SQLite-backed storage of private keys.
-
-Endpoints:
-- POST /auth[?expired=1]  -> returns a JWT signed with an expired or valid key
-- GET  /.well-known/jwks.json -> returns JWKS built from non-expired keys
-
-DB file: totally_not_my_privateKeys.db
-Table schema (created on startup):
-CREATE TABLE IF NOT EXISTS keys(
-    kid INTEGER PRIMARY KEY AUTOINCREMENT,
-    key BLOB NOT NULL,
-    exp INTEGER NOT NULL
-)
-"""
-
 import os
 import sqlite3
 import time
