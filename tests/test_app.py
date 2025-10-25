@@ -1,10 +1,15 @@
 import unittest
 import os
+import sys
 import sqlite3
 import json
 import time
-from app import app, init_db, generate_and_store_keys, get_private_key_from_db, int_to_base64url
 import jwt
+
+# Add parent directory to path to import app module
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from app import app, init_db, generate_and_store_keys, get_private_key_from_db, int_to_base64url
 
 # Use a test database
 TEST_DB = "test_totally_not_my_privateKeys.db"
