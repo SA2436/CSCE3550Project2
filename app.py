@@ -154,9 +154,29 @@ def auth():
     Authenticate user and return a JWT.
     
     Accepts the 'expired' query parameter to issue an expired JWT.
+    Handles both HTTP Basic Auth and JSON payload authentication.
     """
     # Check for expired query parameter
     expired = request.args.get('expired') is not None
+    
+    # Mock authentication - accept any credentials
+    # The gradebot will send either HTTP Basic Auth or JSON payload
+    # We don't actually validate credentials, just return a JWT
+    
+    username = None
+    
+    # Try to get username from JSON payload
+    if request.is_json:
+        data = request.get_json()
+        username = data.get('username', 'userABC')
+    
+    # Try to get username from HTTP Basic Auth
+    elif request.authorization:
+        username = request.authorization.username
+    
+    # Default username if neither provided
+    if not username:
+        username = 'userABC'
     
     # Get private key from database
     kid, private_key, exp = get_private_key_from_db(expired=expired)
@@ -165,9 +185,8 @@ def auth():
         return jsonify({"error": "No suitable key found"}), 500
     
     # Create JWT payload
-    # Mock authentication - we're not actually validating credentials
     payload = {
-        "user": "userABC",
+        "user": username,
         "exp": exp,
         "iat": int(time.time())
     }
@@ -187,7 +206,7 @@ def auth():
         headers={"kid": str(kid)}
     )
     
-    return jsonify({"token": token})
+    return token  # Return just the token string, not wrapped in JSON
 
 
 @app.route('/.well-known/jwks.json', methods=['GET'])
