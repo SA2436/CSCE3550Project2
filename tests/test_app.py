@@ -1,83 +1,218 @@
+import unittest
 import os
-import time
 import sqlite3
 import json
-import pytest
+import time
+from app import app, init_db, generate_and_store_keys, get_private_key_from_db, int_to_base64url
+import jwt
 
-from py3.main import app, DB_FILENAME, ensure_db_and_table, get_db_conn, serialize_private_key_to_pem
-from cryptography.hazmat.primitives.asymmetric import rsa
-
-TEST_DB = DB_FILENAME
-
-
-@pytest.fixture(autouse=True)
-def fresh_db(tmp_path, monkeypatch):
-    """
-    Use a temporary DB file for tests to avoid clobbering real DB.
-    """
-    db_file = tmp_path / "test_keys.db"
-    monkeypatch.setenv("TEST_DB_PATH", str(db_file))
-    # Monkeypatch the DB filename constant in the imported module
-    import importlib
-    import py3.main as m
-    m.DB_FILENAME = str(db_file)
-    # Create DB and table
-    ensure_db_and_table()
-    yield
-    # cleanup
-    try:
-        os.remove(str(db_file))
-    except Exception:
-        pass
+# Use a test database
+TEST_DB = "test_totally_not_my_privateKeys.db"
 
 
-def test_index():
-    client = app.test_client()
-    r = client.get("/")
-    assert r.status_code == 200
-    data = r.get_json()
-    assert "JWKS server running" in data.get("msg", "")
+class TestJWKSServer(unittest.TestCase):
+    
+    @classmethod
+    def setUpClass(cls):
+        """Set up test database before all tests."""
+        # Override the DB_FILE in the app module
+        import app as app_module
+        app_module.DB_FILE = TEST_DB
+        
+        # Remove existing test database if it exists
+        if os.path.exists(TEST_DB):
+            os.remove(TEST_DB)
+    
+    def setUp(self):
+        """Set up test client and database before each test."""
+        self.app = app.test_client()
+        self.app.testing = True
+        
+        # Initialize database
+        init_db()
+        
+        # Clear any existing keys
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM keys")
+        conn.commit()
+        conn.close()
+    
+    def tearDown(self):
+        """Clean up after each test."""
+        if os.path.exists(TEST_DB):
+            conn = sqlite3.connect(TEST_DB)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM keys")
+            conn.commit()
+            conn.close()
+    
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up test database after all tests."""
+        if os.path.exists(TEST_DB):
+            os.remove(TEST_DB)
+    
+    def test_init_db(self):
+        """Test database initialization."""
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        
+        # Check if keys table exists
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='keys'"
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], 'keys')
+    
+    def test_generate_and_store_keys(self):
+        """Test key generation and storage."""
+        generate_and_store_keys()
+        
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM keys")
+        count = cursor.fetchone()[0]
+        conn.close()
+        
+        # Should have at least 2 keys (one expired, one valid)
+        self.assertGreaterEqual(count, 2)
+    
+    def test_get_valid_private_key(self):
+        """Test retrieving a valid (non-expired) private key."""
+        generate_and_store_keys()
+        
+        kid, private_key, exp = get_private_key_from_db(expired=False)
+        
+        self.assertIsNotNone(kid)
+        self.assertIsNotNone(private_key)
+        self.assertIsNotNone(exp)
+        self.assertGreater(exp, int(time.time()))
+    
+    def test_get_expired_private_key(self):
+        """Test retrieving an expired private key."""
+        generate_and_store_keys()
+        
+        kid, private_key, exp = get_private_key_from_db(expired=True)
+        
+        self.assertIsNotNone(kid)
+        self.assertIsNotNone(private_key)
+        self.assertIsNotNone(exp)
+        self.assertLessEqual(exp, int(time.time()))
+    
+    def test_int_to_base64url(self):
+        """Test integer to base64url conversion."""
+        # Test with a known value
+        result = int_to_base64url(65537)
+        self.assertIsInstance(result, str)
+        self.assertGreater(len(result), 0)
+    
+    def test_auth_endpoint_valid(self):
+        """Test /auth endpoint without expired parameter."""
+        generate_and_store_keys()
+        
+        response = self.app.post('/auth')
+        
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn('token', data)
+        
+        # Verify the token can be decoded (without verification)
+        token = data['token']
+        decoded = jwt.decode(token, options={"verify_signature": False})
+        self.assertIn('user', decoded)
+        self.assertIn('exp', decoded)
+    
+    def test_auth_endpoint_expired(self):
+        """Test /auth endpoint with expired parameter."""
+        generate_and_store_keys()
+        
+        response = self.app.post('/auth?expired=true')
+        
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn('token', data)
+        
+        # Verify the token
+        token = data['token']
+        decoded = jwt.decode(token, options={"verify_signature": False})
+        self.assertIn('exp', decoded)
+        # The expiry should be in the past or current time
+        self.assertLessEqual(decoded['exp'], int(time.time()) + 1)
+    
+    def test_auth_endpoint_json_payload(self):
+        """Test /auth endpoint with JSON payload."""
+        generate_and_store_keys()
+        
+        response = self.app.post(
+            '/auth',
+            data=json.dumps({"username": "userABC", "password": "password123"}),
+            content_type='application/json'
+        )
+        
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn('token', data)
+    
+    def test_jwks_endpoint(self):
+        """Test /.well-known/jwks.json endpoint."""
+        generate_and_store_keys()
+        
+        response = self.app.get('/.well-known/jwks.json')
+        
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn('keys', data)
+        self.assertIsInstance(data['keys'], list)
+        
+        # Should have at least one valid key
+        self.assertGreater(len(data['keys']), 0)
+        
+        # Check JWK structure
+        if len(data['keys']) > 0:
+            jwk = data['keys'][0]
+            self.assertIn('kty', jwk)
+            self.assertIn('use', jwk)
+            self.assertIn('kid', jwk)
+            self.assertIn('alg', jwk)
+            self.assertIn('n', jwk)
+            self.assertIn('e', jwk)
+            self.assertEqual(jwk['kty'], 'RSA')
+            self.assertEqual(jwk['alg'], 'RS256')
+    
+    def test_jwks_only_valid_keys(self):
+        """Test that JWKS endpoint only returns valid (non-expired) keys."""
+        generate_and_store_keys()
+        
+        response = self.app.get('/.well-known/jwks.json')
+        data = json.loads(response.data)
+        
+        # Get all keys from database
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM keys WHERE exp > ?", (int(time.time()),))
+        valid_count = cursor.fetchone()[0]
+        conn.close()
+        
+        # JWKS should only contain valid keys
+        self.assertEqual(len(data['keys']), valid_count)
+    
+    def test_no_keys_in_database(self):
+        """Test endpoints when no keys exist in database."""
+        # Don't generate keys
+        
+        response = self.app.post('/auth')
+        self.assertEqual(response.status_code, 500)
+        
+        response = self.app.get('/.well-known/jwks.json')
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertEqual(len(data['keys']), 0)
 
 
-def test_jwks_and_auth_endpoints():
-    client = app.test_client()
-    # Ensure DB has the two keys inserted by ensure_minimum_keys (called on import/run)
-    from py3.main import ensure_minimum_keys, list_keys, choose_key
-    ensure_minimum_keys()
-    rows = list_keys(filter_unexpired=False)
-    assert len(rows) >= 2  # we expect at least two keys in DB
-
-    # Request JWKS - should return at least one key (non-expired)
-    r = client.get("/.well-known/jwks.json")
-    assert r.status_code == 200
-    data = r.get_json()
-    assert "keys" in data
-    assert isinstance(data["keys"], list)
-    # At least one key should be non-expired
-    assert any(int(k["kid"]) >= 1 for k in data["keys"])
-
-    # Test POST /auth without expired param -> returned token
-    payload = {"username": "userABC", "password": "password123"}
-    r = client.post("/auth", json=payload)
-    assert r.status_code == 200
-    token = r.get_json().get("token")
-    assert token is not None
-
-    # Test POST /auth with expired param -> should return a token as well (signed by expired key)
-    r2 = client.post("/auth?expired=1", json=payload)
-    assert r2.status_code == 200
-    token2 = r2.get_json().get("token")
-    assert token2 is not None
-
-
-def test_db_storage_roundtrip():
-    # Directly insert a generated key, then retrieve it
-    from py3.main import store_private_key, choose_key
-    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = serialize_private_key_to_pem(priv)
-    now = int(time.time())
-    kid = store_private_key(pem, now + 3600)
-    assert isinstance(kid, int)
-    # choose a non-expired key should find it (maybe not the only one)
-    chosen = choose_key(expired=False)
-    assert chosen is not None
+if __name__ == '__main__':
+    # Run tests with coverage
+    unittest.main(verbosity=2)
