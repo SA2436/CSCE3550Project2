@@ -1,251 +1,161 @@
-#!/usr/bin/env python3
-import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from urllib.parse import urlparse, parse_qs
+import base64
+import json
+import jwt
+import datetime
 import sqlite3
 import time
-import json
-import math
-from typing import Optional, List, Dict, Tuple
 
-from flask import Flask, request, jsonify, abort
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
-import jwt  # PyJWT
+# Server Configuration
+HOST_NAME = "localhost"
+SERVER_PORT = 8080
+DB_FILE = "totally_not_my_privateKeys.db"
 
-DB_FILENAME = "totally_not_my_privateKeys.db"
-TABLE_SCHEMA = """
+# Database Setup
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
 CREATE TABLE IF NOT EXISTS keys(
     kid INTEGER PRIMARY KEY AUTOINCREMENT,
     key BLOB NOT NULL,
     exp INTEGER NOT NULL
-);
-"""
+)
+""")
+conn.commit()
 
-# JWT settings
-JWT_ALGORITHM = "RS256"
-JWT_ISSUER = "example-jwks-server"
-JWT_AUDIENCE = "example-audience"
-JWT_TTL_SECONDS = 300  # token lifetime for issued JWTs (5 minutes)
-
-app = Flask(__name__)
-
-
-def get_db_conn():
-    """Get a sqlite3 connection. Row factory not required."""
-    conn = sqlite3.connect(DB_FILENAME, check_same_thread=False)
-    return conn
-
-
-def ensure_db_and_table():
-    """Create DB file and table if not present."""
-    conn = get_db_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(TABLE_SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def serialize_private_key_to_pem(private_key: rsa.RSAPrivateKey) -> bytes:
-    """Serialize RSA private key to PKCS1 PEM (bytes)."""
-    pem = private_key.private_bytes(
+# Helper Functions
+def serialize_key(key):
+    """Convert RSA private key to PEM bytes for DB storage."""
+    return key.private_bytes(
         encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,  # PKCS#1
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    return pem
-
-
-def deserialize_private_key_from_pem(pem_bytes: bytes) -> rsa.RSAPrivateKey:
-    """Load a private key from PEM bytes."""
-    return serialization.load_pem_private_key(
-        pem_bytes, password=None, backend=default_backend()
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption()
     )
 
+def deserialize_key(pem_data):
+    """Convert PEM bytes from DB back to RSA private key."""
+    return serialization.load_pem_private_key(pem_data, password=None)
 
-def int_to_base64url(n: int) -> str:
-    """Convert integer to base64url per JWK spec (no padding)."""
-    # Compute big-endian byte length
-    byte_length = math.ceil(n.bit_length() / 8)
-    # convert to bytes
-    n_bytes = n.to_bytes(byte_length, "big")
-    import base64
+def int_to_base64(value):
+    """Convert integer to Base64URL-encoded string (for JWKS 'n' and 'e')."""
+    value_hex = format(value, 'x')
+    if len(value_hex) % 2 == 1:
+        value_hex = '0' + value_hex
+    value_bytes = bytes.fromhex(value_hex)
+    encoded = base64.urlsafe_b64encode(value_bytes).rstrip(b'=')
+    return encoded.decode('utf-8')
 
-    b64 = base64.urlsafe_b64encode(n_bytes).rstrip(b"=").decode("ascii")
-    return b64
+def ensure_keys_exist():
+    """Generate one valid and one expired RSA key if DB is empty."""
+    cursor.execute("SELECT COUNT(*) FROM keys")
+    count = cursor.fetchone()[0]
 
+    if count == 0:
+        print("Generating initial keys...")
+        valid_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        expired_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        now = int(time.time())
 
-def rsa_public_key_to_jwk(public_key: rsa.RSAPublicKey, kid: int) -> Dict:
-    """Convert RSA public key to a JWK dict with kid."""
-    numbers = public_key.public_numbers()
-    n_b64 = int_to_base64url(numbers.n)
-    e_b64 = int_to_base64url(numbers.e)
-    jwk = {
-        "kty": "RSA",
-        "kid": str(kid),
-        "use": "sig",
-        "alg": "RS256",
-        "n": n_b64,
-        "e": e_b64,
-    }
-    return jwk
-
-
-def store_private_key(pem_bytes: bytes, exp_ts: int) -> int:
-    """
-    Store private key PEM in DB. Returns the assigned kid (rowid).
-    Uses parameterized queries to avoid SQL injection.
-    """
-    conn = get_db_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (pem_bytes, exp_ts))
+        # Expired key: already expired 10 seconds ago
+        cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (serialize_key(expired_key), now - 10))
+        # Valid key: expires 1 hour from now
+        cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (serialize_key(valid_key), now + 3600))
         conn.commit()
-        kid = cur.lastrowid
-        return kid
-    finally:
-        conn.close()
+    
 
+# Ensure DB has the required keys
+ensure_keys_exist()
 
-def list_keys(filter_unexpired: bool = True) -> List[Tuple[int, bytes, int]]:
-    """Return list of (kid, key_pem, exp_ts). If filter_unexpired -> only non-expired."""
-    conn = get_db_conn()
-    try:
-        cur = conn.cursor()
-        now_ts = int(time.time())
-        if filter_unexpired:
-            cur.execute("SELECT kid, key, exp FROM keys WHERE exp > ?", (now_ts,))
-        else:
-            cur.execute("SELECT kid, key, exp FROM keys")
-        rows = cur.fetchall()
-        # rows: list of (kid (int), key (bytes), exp (int))
-        return rows
-    finally:
-        conn.close()
+# HTTP Request Handler
+class MyServer(BaseHTTPRequestHandler):
+    def do_PUT(self): self.method_not_allowed()
+    def do_PATCH(self): self.method_not_allowed()
+    def do_DELETE(self): self.method_not_allowed()
+    def do_HEAD(self): self.method_not_allowed()
 
+    def method_not_allowed(self):
+        """Send 405 for unsupported HTTP methods."""
+        self.send_response(405)
+        self.end_headers()
 
-def choose_key(expired: bool = False) -> Optional[Tuple[int, bytes, int]]:
-    """
-    Choose one key from DB matching expiration filter.
-    If expired is True, choose a key with exp <= now. Else choose exp > now.
-    Returns (kid, pem_bytes, exp) or None if none exist.
-    """
-    conn = get_db_conn()
-    try:
-        cur = conn.cursor()
-        now_ts = int(time.time())
-        if expired:
-            cur.execute("SELECT kid, key, exp FROM keys WHERE exp <= ? ORDER BY kid LIMIT 1", (now_ts,))
-        else:
-            cur.execute("SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY kid LIMIT 1", (now_ts,))
-        row = cur.fetchone()
-        return row
-    finally:
-        conn.close()
+    # POST /auth endpoint
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        params = parse_qs(parsed_path.query)
 
+        if parsed_path.path == "/auth":
+            now = int(time.time())
+            expired = 'expired' in params
 
-def ensure_minimum_keys():
-    """
-    Ensure at least one expired and one valid (>= 1 hour) key exist in DB.
-    If not present, generate and insert keys. Keys are RSA 2048 bits.
-    """
-    conn = get_db_conn()
-    try:
-        cur = conn.cursor()
-        now_ts = int(time.time())
-        # Check for expired key (exp <= now)
-        cur.execute("SELECT COUNT(1) FROM keys WHERE exp <= ?", (now_ts,))
-        expired_count = cur.fetchone()[0]
-        # Check for valid key (exp >= now + 3600)
-        cur.execute("SELECT COUNT(1) FROM keys WHERE exp >= ?", (now_ts + 3600,))
-        valid_count = cur.fetchone()[0]
+            # Select key depending on query
+            if expired:
+                cursor.execute("SELECT kid, key, exp FROM keys WHERE exp <= ? LIMIT 1", (now,))
+            else:
+                cursor.execute("SELECT kid, key, exp FROM keys WHERE exp > ? LIMIT 1", (now,))
 
-        if expired_count == 0:
-            # generate one expired key (expiration = now - 1)
-            priv = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
-            pem = serialize_private_key_to_pem(priv)
-            store_private_key(pem, now_ts - 1)
+            row = cursor.fetchone()
+            if not row:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"No suitable key found.")
+                return
 
-        if valid_count == 0:
-            # generate one valid key (expiration = now + 3600)
-            priv = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
-            pem = serialize_private_key_to_pem(priv)
-            store_private_key(pem, now_ts + 3600)
-    finally:
-        conn.close()
+            kid, pem_data, exp = row
+            key = deserialize_key(pem_data)
 
+            headers = {"kid": str(kid)}
+            token_payload = {
+                "user": "userABC",
+                "exp": exp
+            }
 
-@app.route("/.well-known/jwks.json", methods=["GET"])
-def jwks():
-    """
-    Return JWKS containing public keys for all non-expired keys in DB.
-    """
-    rows = list_keys(filter_unexpired=True)
-    jwks_keys = []
-    for kid, key_blob, exp in rows:
-        try:
-            priv = deserialize_private_key_from_pem(key_blob)
-            pub = priv.public_key()
-            jwk = rsa_public_key_to_jwk(pub, kid)
-            # include 'exp' in the key object as extra (not standard JWKS field) only if desired.
-            # The grading client expects keys with kid and public components; adding 'exp' won't break things.
-            jwk["exp"] = exp
-            jwks_keys.append(jwk)
-        except Exception as e:
-            app.logger.exception("Failed to convert key kid=%s to JWK: %s", kid, e)
-            continue
-    return jsonify({"keys": jwks_keys})
+            encoded_jwt = jwt.encode(token_payload, key, algorithm="RS256", headers=headers)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(bytes(encoded_jwt, "utf-8"))
+            return
 
+        self.method_not_allowed()
 
-@app.route("/auth", methods=["POST"])
-def auth():
-    """
-    Return a signed JWT. Accepts JSON payload {"username": "...", "password": "..."}.
-    The 'expired' query parameter (any value) will cause the server to use an expired key.
-    """
-    use_expired = "expired" in request.args
-    # Accept JSON body; tests expect username/password, but we don't validate them.
-    data = request.get_json(silent=True) or {}
-    username = data.get("username", "anonymous")
-    # Choose appropriate key
-    row = choose_key(expired=use_expired)
-    if not row:
-        return jsonify({"error": "no matching key available"}), 500
-    kid, pem_bytes, key_exp = row
-    try:
-        priv = deserialize_private_key_from_pem(pem_bytes)
-    except Exception as e:
-        app.logger.exception("Failed to load private key kid=%s: %s", kid, e)
-        return jsonify({"error": "failed to load signing key"}), 500
+    # GET /.well-known/jwks.json
+    def do_GET(self):
+        if self.path == "/.well-known/jwks.json":
+            now = int(time.time())
+            cursor.execute("SELECT kid, key, exp FROM keys WHERE exp > ?", (now,))
+            rows = cursor.fetchall()
 
-    now_ts = int(time.time())
-    payload = {
-        "sub": username,
-        "iat": now_ts,
-        "exp": now_ts + JWT_TTL_SECONDS,
-        "iss": JWT_ISSUER,
-        "aud": JWT_AUDIENCE,
-    }
-    # Sign with PyJWT using private key object or PEM
-    token = jwt.encode(payload, pem_bytes, algorithm=JWT_ALGORITHM, headers={"kid": str(kid)})
-    return jsonify({"token": token})
+            jwks = {"keys": []}
+            for kid, pem_data, exp in rows:
+                key = deserialize_key(pem_data)
+                numbers = key.private_numbers().public_numbers
 
+                jwks["keys"].append({
+                    "alg": "RS256",
+                    "kty": "RSA",
+                    "use": "sig",
+                    "kid": str(kid),
+                    "n": int_to_base64(numbers.n),
+                    "e": int_to_base64(numbers.e)
+                })
 
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({"msg": "JWKS server running"})
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(bytes(json.dumps(jwks), "utf-8"))
+            return
 
+        self.method_not_allowed()
 
-def main():
-    # Ensure DB exists and has schema
-    ensure_db_and_table()
-    # Ensure at least one expired and one valid key
-    ensure_minimum_keys()
-    # Run Flask
-    app.run(host="0.0.0.0", port=8080)
-
-
+# Server Startup
 if __name__ == "__main__":
-    main()
+    webServer = HTTPServer((HOST_NAME, SERVER_PORT), MyServer)
+    try:
+        webServer.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        conn.close()
+        webServer.server_close()
