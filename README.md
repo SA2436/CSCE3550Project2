@@ -18,3 +18,7 @@ for gradebot
 #type - chmod +x gradebot 
 #type - ./gradebot
 
+<img width="1512" height="982" alt="Screenshot 2025-10-24 at 7 29 01 PM" src="https://github.com/user-attachments/assets/c0fc6091-8af8-49ef-889b-523263d0bf84" />
+<img width="1512" height="982" alt="Screenshot 2025-10-24 at 7 36 05 PM" src="https://github.com/user-attachments/assets/7f7be07b-40fb-41dc-a272-63a93ae4d53a" />
+<img width="1512" height="982" alt="Screenshot 2025-10-24 at 7 37 11 PM" src="https://github.com/user-attachments/assets/a54191bc-09ee-466c-98d9-56ce633b32f9" />
+<img width="1512" height="982" alt="Screenshot 2025-10-24 at 7 38 19 PM" src="https://github.com/user-attachments/assets/37199b09-abb9-4a7a-8a6d-68f44df6ead7" />
